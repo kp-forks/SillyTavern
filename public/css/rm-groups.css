@@ -58,14 +58,19 @@
     cursor: unset;
 }
 
+#rm_group_buttons textarea {
+    margin: 0px;
+    min-width: 200px;
+}
+
 #rm_group_members,
 #rm_group_add_members {
     margin-top: 0.25rem;
     margin-bottom: 0.5rem;
     border: 1px solid var(--SmartThemeBorderColor);
-    ;
     border-radius: 10px;
     background-color: var(--black30a);
+    padding: 2px;
 }
 
 #rm_group_buttons_expander {

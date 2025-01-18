@@ -1,22 +1,19 @@
-const path = require('path');
-const express = require('express');
-const sanitize = require('sanitize-filename');
-const writeFileAtomicSync = require('write-file-atomic').sync;
+import path from 'node:path';
+import express from 'express';
+import sanitize from 'sanitize-filename';
+import { sync as writeFileAtomicSync } from 'write-file-atomic';
 
-const { jsonParser } = require('../express-common');
-const { DIRECTORIES } = require('../constants');
+import { jsonParser } from '../express-common.js';
 
-const router = express.Router();
+export const router = express.Router();
 
 router.post('/save', jsonParser, (request, response) => {
     if (!request.body || !request.body.name) {
         return response.sendStatus(400);
     }
 
-    const filename = path.join(DIRECTORIES.movingUI, sanitize(request.body.name) + '.json');
+    const filename = path.join(request.user.directories.movingUI, sanitize(request.body.name) + '.json');
     writeFileAtomicSync(filename, JSON.stringify(request.body, null, 4), 'utf8');
 
     return response.sendStatus(200);
 });
-
-module.exports = { router };

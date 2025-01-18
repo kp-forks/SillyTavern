@@ -9,10 +9,14 @@ import {
 } from '../script.js';
 import { selected_group } from './group-chats.js';
 import { extension_settings, getContext, saveMetadataDebounced } from './extensions.js';
-import { registerSlashCommand } from './slash-commands.js';
 import { getCharaFilename, debounce, delay } from './utils.js';
-import { getTokenCount } from './tokenizers.js';
+import { getTokenCountAsync } from './tokenizers.js';
+import { debounce_timeout } from './constants.js';
+import { SlashCommandParser } from './slash-commands/SlashCommandParser.js';
+import { SlashCommand } from './slash-commands/SlashCommand.js';
+import { ARGUMENT_TYPE, SlashCommandArgument } from './slash-commands/SlashCommandArgument.js';
 export { MODULE_NAME as NOTE_MODULE_NAME };
+import { t } from './i18n.js';
 
 const MODULE_NAME = '2_floating_prompt'; // <= Deliberate, for sorting lower than memory
 
@@ -33,49 +37,85 @@ const chara_note_position = {
 };
 
 function setNoteTextCommand(_, text) {
-    $('#extension_floating_prompt').val(text).trigger('input');
-    toastr.success('Author\'s Note text updated');
+    if (text) {
+        $('#extension_floating_prompt').val(text).trigger('input');
+        toastr.success(t`Author's Note text updated`);
+    }
+    return chat_metadata[metadata_keys.prompt];
 }
 
 function setNoteDepthCommand(_, text) {
-    const value = Number(text);
+    if (text) {
+        const value = Number(text);
 
-    if (Number.isNaN(value)) {
-        toastr.error('Not a valid number');
-        return;
+        if (Number.isNaN(value)) {
+            toastr.error(t`Not a valid number`);
+            return;
+        }
+
+        $('#extension_floating_depth').val(Math.abs(value)).trigger('input');
+        toastr.success(t`Author's Note depth updated`);
     }
-
-    $('#extension_floating_depth').val(Math.abs(value)).trigger('input');
-    toastr.success('Author\'s Note depth updated');
+    return chat_metadata[metadata_keys.depth];
 }
 
 function setNoteIntervalCommand(_, text) {
-    const value = Number(text);
+    if (text) {
+        const value = Number(text);
 
-    if (Number.isNaN(value)) {
-        toastr.error('Not a valid number');
-        return;
+        if (Number.isNaN(value)) {
+            toastr.error(t`Not a valid number`);
+            return;
+        }
+
+        $('#extension_floating_interval').val(Math.abs(value)).trigger('input');
+        toastr.success(t`Author's Note frequency updated`);
     }
-
-    $('#extension_floating_interval').val(Math.abs(value)).trigger('input');
-    toastr.success('Author\'s Note frequency updated');
+    return chat_metadata[metadata_keys.interval];
 }
 
 function setNotePositionCommand(_, text) {
     const validPositions = {
+        'after': 0,
         'scenario': 0,
         'chat': 1,
+        'before_scenario': 2,
+        'before': 2,
     };
 
-    const position = validPositions[text?.trim()];
+    if (text) {
+        const position = validPositions[text?.trim()?.toLowerCase()];
 
-    if (Number.isNaN(position)) {
-        toastr.error('Not a valid position');
-        return;
+        if (typeof position === 'undefined') {
+            toastr.error(t`Not a valid position`);
+            return;
+        }
+
+        $(`input[name="extension_floating_position"][value="${position}"]`).prop('checked', true).trigger('input');
+        toastr.info(t`Author's Note position updated`);
     }
+    return Object.keys(validPositions).find(key => validPositions[key] == chat_metadata[metadata_keys.position]);
+}
 
-    $(`input[name="extension_floating_position"][value="${position}"]`).prop('checked', true).trigger('input');
-    toastr.info('Author\'s Note position updated');
+function setNoteRoleCommand(_, text) {
+    const validRoles = {
+        'system': 0,
+        'user': 1,
+        'assistant': 2,
+    };
+
+    if (text) {
+        const role = validRoles[text?.trim()?.toLowerCase()];
+
+        if (typeof role === 'undefined') {
+            toastr.error(t`Not a valid role`);
+            return;
+        }
+
+        $('#extension_floating_role').val(Math.abs(role)).trigger('input');
+        toastr.info(t`Author's Note role updated`);
+    }
+    return Object.keys(validRoles).find(key => validRoles[key] == chat_metadata[metadata_keys.role]);
 }
 
 function updateSettings() {
@@ -84,9 +124,9 @@ function updateSettings() {
     setFloatingPrompt();
 }
 
-const setMainPromptTokenCounterDebounced = debounce((value) => $('#extension_floating_prompt_token_counter').text(getTokenCount(value)), 1000);
-const setCharaPromptTokenCounterDebounced = debounce((value) => $('#extension_floating_chara_token_counter').text(getTokenCount(value)), 1000);
-const setDefaultPromptTokenCounterDebounced = debounce((value) => $('#extension_floating_default_token_counter').text(getTokenCount(value)), 1000);
+const setMainPromptTokenCounterDebounced = debounce(async (value) => $('#extension_floating_prompt_token_counter').text(await getTokenCountAsync(value)), debounce_timeout.relaxed);
+const setCharaPromptTokenCounterDebounced = debounce(async (value) => $('#extension_floating_chara_token_counter').text(await getTokenCountAsync(value)), debounce_timeout.relaxed);
+const setDefaultPromptTokenCounterDebounced = debounce(async (value) => $('#extension_floating_default_token_counter').text(await getTokenCountAsync(value)), debounce_timeout.relaxed);
 
 async function onExtensionFloatingPromptInput() {
     chat_metadata[metadata_keys.prompt] = $(this).val();
@@ -199,7 +239,7 @@ function onExtensionFloatingCharaPromptInput() {
         extension_settings.note.chara.push(tempCharaNote);
     } else {
         console.log('Character author\'s note error: No avatar name key could be found.');
-        toastr.error('Something went wrong. Could not save character\'s author\'s note.');
+        toastr.error(t`Something went wrong. Could not save character's author's note.`);
 
         // Don't save settings if something went wrong
         return;
@@ -319,7 +359,7 @@ export function setFloatingPrompt() {
     shouldWIAddPrompt = shouldAddPrompt;
 
     let prompt = shouldAddPrompt ? $('#extension_floating_prompt').val() : '';
-    if (shouldAddPrompt && extension_settings.note.chara && getContext().characterId) {
+    if (shouldAddPrompt && extension_settings.note.chara && getContext().characterId !== undefined) {
         const charaNote = extension_settings.note.chara.find((e) => e.name === getCharaFilename());
 
         // Only replace with the chara note if the user checked the box
@@ -390,19 +430,19 @@ function onANMenuItemClick() {
         //because this listener takes priority
         $('#options').stop().fadeOut(animation_duration);
     } else {
-        toastr.warning('Select a character before trying to use Author\'s Note', '', { timeOut: 2000 });
+        toastr.warning(t`Select a character before trying to use Author's Note`, '', { timeOut: 2000 });
     }
 }
 
-function onChatChanged() {
+async function onChatChanged() {
     loadSettings();
     setFloatingPrompt();
     const context = getContext();
 
     // Disable the chara note if in a group
-    $('#extension_floating_chara').prop('disabled', context.groupId ? true : false);
+    $('#extension_floating_chara').prop('disabled', !!context.groupId);
 
-    const tokenCounter1 = chat_metadata[metadata_keys.prompt] ? getTokenCount(chat_metadata[metadata_keys.prompt]) : 0;
+    const tokenCounter1 = chat_metadata[metadata_keys.prompt] ? await getTokenCountAsync(chat_metadata[metadata_keys.prompt]) : 0;
     $('#extension_floating_prompt_token_counter').text(tokenCounter1);
 
     let tokenCounter2;
@@ -410,15 +450,13 @@ function onChatChanged() {
         const charaNote = extension_settings.note.chara.find((e) => e.name === getCharaFilename());
 
         if (charaNote) {
-            tokenCounter2 = getTokenCount(charaNote.prompt);
+            tokenCounter2 = await getTokenCountAsync(charaNote.prompt);
         }
     }
 
-    if (tokenCounter2) {
-        $('#extension_floating_chara_token_counter').text(tokenCounter2);
-    }
+    $('#extension_floating_chara_token_counter').text(tokenCounter2 || 0);
 
-    const tokenCounter3 = extension_settings.note.default ? getTokenCount(extension_settings.note.default) : 0;
+    const tokenCounter3 = extension_settings.note.default ? await getTokenCountAsync(extension_settings.note.default) : 0;
     $('#extension_floating_default_token_counter').text(tokenCounter3);
 }
 
@@ -456,9 +494,86 @@ export function initAuthorsNote() {
     });
     $('#option_toggle_AN').on('click', onANMenuItemClick);
 
-    registerSlashCommand('note', setNoteTextCommand, [], '<span class=\'monospace\'>(text)</span> – sets an author\'s note for the currently selected chat', true, true);
-    registerSlashCommand('depth', setNoteDepthCommand, [], '<span class=\'monospace\'>(number)</span> – sets an author\'s note depth for in-chat positioning', true, true);
-    registerSlashCommand('freq', setNoteIntervalCommand, ['interval'], '<span class=\'monospace\'>(number)</span> – sets an author\'s note insertion frequency', true, true);
-    registerSlashCommand('pos', setNotePositionCommand, ['position'], '(<span class=\'monospace\'>chat</span> or <span class=\'monospace\'>scenario</span>) – sets an author\'s note position', true, true);
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'note',
+        callback: setNoteTextCommand,
+        returns: 'current author\'s note',
+        unnamedArgumentList: [
+            new SlashCommandArgument(
+                'text', [ARGUMENT_TYPE.STRING], false,
+            ),
+        ],
+        helpString: `
+            <div>
+                Sets an author's note for the currently selected chat if specified and returns the current note.
+            </div>
+        `,
+    }));
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'note-depth',
+        aliases: ['depth'],
+        callback: setNoteDepthCommand,
+        returns: 'current author\'s note depth',
+        unnamedArgumentList: [
+            new SlashCommandArgument(
+                'number', [ARGUMENT_TYPE.NUMBER], false,
+            ),
+        ],
+        helpString: `
+            <div>
+                Sets an author's note depth for in-chat positioning if specified and returns the current depth.
+            </div>
+        `,
+    }));
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'note-frequency',
+        aliases: ['freq', 'note-freq'],
+        callback: setNoteIntervalCommand,
+        returns: 'current author\'s note insertion frequency',
+        namedArgumentList: [],
+        unnamedArgumentList: [
+            new SlashCommandArgument(
+                'number', [ARGUMENT_TYPE.NUMBER], false,
+            ),
+        ],
+        helpString: `
+            <div>
+                Sets an author's note insertion frequency if specified and returns the current frequency.
+            </div>
+        `,
+    }));
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'note-position',
+        callback: setNotePositionCommand,
+        aliases: ['pos', 'note-pos'],
+        returns: 'current author\'s note insertion position',
+        namedArgumentList: [],
+        unnamedArgumentList: [
+            new SlashCommandArgument(
+                'position', [ARGUMENT_TYPE.STRING], false, false, null, ['before', 'after', 'chat'],
+            ),
+        ],
+        helpString: `
+            <div>
+                Sets an author's note position if specified and returns the current position.
+            </div>
+        `,
+    }));
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'note-role',
+        callback: setNoteRoleCommand,
+        returns: 'current author\'s note chat insertion role',
+        namedArgumentList: [],
+        unnamedArgumentList: [
+            new SlashCommandArgument(
+                'position', [ARGUMENT_TYPE.STRING], false, false, null, ['system', 'user', 'assistant'],
+            ),
+        ],
+        helpString: `
+            <div>
+                Sets an author's note chat insertion role if specified and returns the current role.
+            </div>
+        `,
+    }));
     eventSource.on(event_types.CHAT_CHANGED, onChatChanged);
 }

@@ -1,16 +1,20 @@
-const express = require('express');
-const { jsonParser } = require('../express-common');
+import express from 'express';
+
+import { getPipeline } from '../transformers.js';
+import { jsonParser } from '../express-common.js';
 
 const TASK = 'text-classification';
 
-const router = express.Router();
+export const router = express.Router();
 
-const cacheObject = {};
+/**
+ * @type {Map<string, object>} Cache for classification results
+ */
+const cacheObject = new Map();
 
 router.post('/labels', jsonParser, async (req, res) => {
     try {
-        const module = await import('../transformers.mjs');
-        const pipe = await module.default.getPipeline(TASK);
+        const pipe = await getPipeline(TASK);
         const result = Object.keys(pipe.model.config.label2id);
         return res.json({ labels: result });
     } catch (error) {
@@ -23,15 +27,19 @@ router.post('/', jsonParser, async (req, res) => {
     try {
         const { text } = req.body;
 
+        /**
+         * Get classification result for a given text
+         * @param {string} text Text to classify
+         * @returns {Promise<object>} Classification result
+         */
         async function getResult(text) {
-            if (Object.hasOwn(cacheObject, text)) {
-                return cacheObject[text];
+            if (cacheObject.has(text)) {
+                return cacheObject.get(text);
             } else {
-                const module = await import('../transformers.mjs');
-                const pipe = await module.default.getPipeline(TASK);
+                const pipe = await getPipeline(TASK);
                 const result = await pipe(text, { topk: 5 });
                 result.sort((a, b) => b.score - a.score);
-                cacheObject[text] = result;
+                cacheObject.set(text, result);
                 return result;
             }
         }
@@ -46,5 +54,3 @@ router.post('/', jsonParser, async (req, res) => {
         return res.sendStatus(500);
     }
 });
-
-module.exports = { router };

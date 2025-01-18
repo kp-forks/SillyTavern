@@ -1,11 +1,13 @@
 /**
  * Scripts to be done before starting the server for the first time.
  */
-const fs = require('fs');
-const path = require('path');
-const crypto = require('crypto');
-const yaml = require('yaml');
-const _ = require('lodash');
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import process from 'node:process';
+import yaml from 'yaml';
+import _ from 'lodash';
+import { createRequire } from 'node:module';
 
 /**
  * Colorizes console output.
@@ -25,6 +27,44 @@ const color = {
     cyan: (mess) => color.byNum(mess, 36),
     white: (mess) => color.byNum(mess, 37),
 };
+
+const keyMigrationMap = [
+    {
+        oldKey: 'disableThumbnails',
+        newKey: 'thumbnails.enabled',
+        migrate: (value) => !value,
+    },
+    {
+        oldKey: 'thumbnailsQuality',
+        newKey: 'thumbnails.quality',
+        migrate: (value) => value,
+    },
+    {
+        oldKey: 'avatarThumbnailsPng',
+        newKey: 'thumbnails.format',
+        migrate: (value) => (value ? 'png' : 'jpg'),
+    },
+    {
+        oldKey: 'disableChatBackup',
+        newKey: 'backups.chat.enabled',
+        migrate: (value) => !value,
+    },
+    {
+        oldKey: 'numberOfBackups',
+        newKey: 'backups.common.numberOfBackups',
+        migrate: (value) => value,
+    },
+    {
+        oldKey: 'maxTotalChatBackups',
+        newKey: 'backups.chat.maxTotalBackups',
+        migrate: (value) => value,
+    },
+    {
+        oldKey: 'chatBackupThrottleInterval',
+        newKey: 'backups.chat.throttleInterval',
+        migrate: (value) => value,
+    },
+];
 
 /**
  * Gets all keys from an object recursively.
@@ -59,12 +99,15 @@ function convertConfig() {
 
         try {
             console.log(color.blue('Converting config.conf to config.yaml. Your old config.conf will be renamed to config.conf.bak'));
-            const config = require(path.join(process.cwd(), './config.conf'));
-            fs.renameSync('./config.conf', './config.conf.bak');
+            fs.renameSync('./config.conf', './config.conf.cjs'); // Force loading as CommonJS
+            const require = createRequire(import.meta.url);
+            const config = require(path.join(process.cwd(), './config.conf.cjs'));
+            fs.copyFileSync('./config.conf.cjs', './config.conf.bak');
+            fs.rmSync('./config.conf.cjs');
             fs.writeFileSync('./config.yaml', yaml.stringify(config));
             console.log(color.green('Conversion successful. Please check your config.yaml and fix it if necessary.'));
         } catch (error) {
-            console.error(color.red('FATAL: Config conversion failed. Please check your config.conf file and try again.'));
+            console.error(color.red('FATAL: Config conversion failed. Please check your config.conf file and try again.'), error);
             return;
         }
     }
@@ -74,9 +117,27 @@ function convertConfig() {
  * Compares the current config.yaml with the default config.yaml and adds any missing values.
  */
 function addMissingConfigValues() {
-    try  {
+    try {
         const defaultConfig = yaml.parse(fs.readFileSync(path.join(process.cwd(), './default/config.yaml'), 'utf8'));
         let config = yaml.parse(fs.readFileSync(path.join(process.cwd(), './config.yaml'), 'utf8'));
+
+        // Migrate old keys to new keys
+        const migratedKeys = [];
+        for (const { oldKey, newKey, migrate } of keyMigrationMap) {
+            if (_.has(config, oldKey)) {
+                const oldValue = _.get(config, oldKey);
+                const newValue = migrate(oldValue);
+                _.set(config, newKey, newValue);
+                _.unset(config, oldKey);
+
+                migratedKeys.push({
+                    oldKey,
+                    newKey,
+                    oldValue,
+                    newValue,
+                });
+            }
+        }
 
         // Get all keys from the original config
         const originalKeys = getAllKeys(config);
@@ -90,11 +151,18 @@ function addMissingConfigValues() {
         // Find the keys that were added
         const addedKeys = _.difference(updatedKeys, originalKeys);
 
-        if (addedKeys.length === 0) {
+        if (addedKeys.length === 0 && migratedKeys.length === 0) {
             return;
         }
 
-        console.log('Adding missing config values to config.yaml:', addedKeys);
+        if (addedKeys.length > 0) {
+            console.log('Adding missing config values to config.yaml:', addedKeys);
+        }
+
+        if (migratedKeys.length > 0) {
+            console.log('Migrating config values in config.yaml:', migratedKeys);
+        }
+
         fs.writeFileSync('./config.yaml', yaml.stringify(config));
     } catch (error) {
         console.error(color.red('FATAL: Could not add missing config values to config.yaml'), error);
@@ -106,7 +174,6 @@ function addMissingConfigValues() {
  */
 function createDefaultFiles() {
     const files = {
-        settings: './public/settings.json',
         config: './config.yaml',
         user: './public/css/user.css',
     };
@@ -132,7 +199,7 @@ function createDefaultFiles() {
 function getMd5Hash(data) {
     return crypto
         .createHash('md5')
-        .update(data)
+        .update(new Uint8Array(data))
         .digest('hex');
 }
 
@@ -167,29 +234,6 @@ function copyWasmFiles() {
     }
 }
 
-/**
- * Moves the custom background into settings.json.
- */
-function migrateBackground() {
-    if (!fs.existsSync('./public/css/bg_load.css')) return;
-
-    const bgCSS = fs.readFileSync('./public/css/bg_load.css', 'utf-8');
-    const bgMatch = /url\('([^']*)'\)/.exec(bgCSS);
-    if (!bgMatch) return;
-    const bgFilename = bgMatch[1].replace('../backgrounds/', '');
-
-    const settings = fs.readFileSync('./public/settings.json', 'utf-8');
-    const settingsJSON = JSON.parse(settings);
-    if (Object.hasOwn(settingsJSON, 'background')) {
-        console.log(color.yellow('Both bg_load.css and the "background" setting exist. Please delete bg_load.css manually.'));
-        return;
-    }
-
-    settingsJSON.background = { name: bgFilename, url: `url('backgrounds/${bgFilename}')` };
-    fs.writeFileSync('./public/settings.json', JSON.stringify(settingsJSON, null, 4));
-    fs.rmSync('./public/css/bg_load.css');
-}
-
 try {
     // 0. Convert config.conf to config.yaml
     convertConfig();
@@ -199,8 +243,6 @@ try {
     copyWasmFiles();
     // 3. Add missing config values
     addMissingConfigValues();
-    // 4. Migrate bg_load.css to settings.json
-    migrateBackground();
 } catch (error) {
     console.error(error);
 }

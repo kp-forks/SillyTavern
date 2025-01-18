@@ -1,8 +1,11 @@
-import { callPopup, main_api } from '../../../script.js';
+import { main_api } from '../../../script.js';
 import { getContext } from '../../extensions.js';
-import { registerSlashCommand } from '../../slash-commands.js';
-import { getFriendlyTokenizerName, getTextTokens, getTokenCount, tokenizers } from '../../tokenizers.js';
+import { SlashCommand } from '../../slash-commands/SlashCommand.js';
+import { SlashCommandParser } from '../../slash-commands/SlashCommandParser.js';
+import { getFriendlyTokenizerName, getTextTokens, getTokenCountAsync, tokenizers } from '../../tokenizers.js';
 import { resetScrollHeight, debounce } from '../../utils.js';
+import { debounce_timeout } from '../../constants.js';
+import { POPUP_TYPE, callGenericPopup } from '../../popup.js';
 
 function rgb2hex(rgb) {
     rgb = rgb.match(/^rgba?[\s+]?\([\s+]?(\d+)[\s+]?,[\s+]?(\d+)[\s+]?,[\s+]?(\d+)[\s+]?/i);
@@ -38,7 +41,7 @@ async function doTokenCounter() {
     </div>`;
 
     const dialog = $(html);
-    const countDebounced = debounce(() => {
+    const countDebounced = debounce(async () => {
         const text = String($('#token_counter_textarea').val());
         const ids = main_api == 'openai' ? getTextTokens(tokenizers.OPENAI, text) : getTextTokens(tokenizerId, text);
 
@@ -50,20 +53,20 @@ async function doTokenCounter() {
                 drawChunks(Object.getOwnPropertyDescriptor(ids, 'chunks').value, ids);
             }
         } else {
-            const context = getContext();
-            const count = context.getTokenCount(text);
+            const count = await getTokenCountAsync(text);
             $('#token_counter_ids').text('—');
             $('#token_counter_result').text(count);
             $('#tokenized_chunks_display').text('—');
         }
 
-        resetScrollHeight($('#token_counter_textarea'));
-        resetScrollHeight($('#token_counter_ids'));
-    }, 1000);
+        if (!CSS.supports('field-sizing', 'content')) {
+            await resetScrollHeight($('#token_counter_textarea'));
+            await resetScrollHeight($('#token_counter_ids'));
+        }
+    }, debounce_timeout.relaxed);
     dialog.find('#token_counter_textarea').on('input', () => countDebounced());
 
-    $('#dialogue_popup').addClass('wide_dialogue_popup');
-    callPopup(dialog, 'text', '', { wide: true, large: true });
+    callGenericPopup(dialog, POPUP_TYPE.TEXT, '', { wide: true, large: true, allowVerticalScrolling: true });
 }
 
 /**
@@ -86,7 +89,7 @@ function drawChunks(chunks, ids) {
     $('#tokenized_chunks_display').empty();
 
     for (let i = 0; i < chunks.length; i++) {
-        let chunk = chunks[i].replace(/▁/g, ' '); // This is a leading space in sentencepiece. More info: Lower one eighth block (U+2581)
+        let chunk = chunks[i].replace(/[▁Ġ]/g, ' '); // This is a leading space in sentencepiece. More info: Lower one eighth block (U+2581)
 
         // If <0xHEX>, decode it
         if (/^<0x[0-9A-F]+>$/i.test(chunk)) {
@@ -109,7 +112,7 @@ function drawChunks(chunks, ids) {
     }
 }
 
-function doCount() {
+async function doCount() {
     // get all of the messages in the chat
     const context = getContext();
     const messages = context.chat.filter(x => x.mes && !x.is_system).map(x => x.mes);
@@ -120,7 +123,9 @@ function doCount() {
     console.debug('All messages:', allMessages);
 
     //toastr success with the token count of the chat
-    toastr.success(`Token count: ${getTokenCount(allMessages)}`);
+    const count = await getTokenCountAsync(allMessages);
+    toastr.success(`Token count: ${count}`);
+    return count;
 }
 
 jQuery(() => {
@@ -129,7 +134,13 @@ jQuery(() => {
             <div class="fa-solid fa-1 extensionsMenuExtensionButton" /></div>
             Token Counter
         </div>`;
-    $('#extensionsMenu').prepend(buttonHtml);
+    $('#token_counter_wand_container').append(buttonHtml);
     $('#token_counter').on('click', doTokenCounter);
-    registerSlashCommand('count', doCount, [], '– counts the number of tokens in the current chat', true, false);
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'count',
+        callback: async () => String(await doCount()),
+        returns: 'number of tokens',
+        helpString: 'Counts the number of tokens in the current chat.',
+    }));
+
 });

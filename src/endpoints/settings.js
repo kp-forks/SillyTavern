@@ -1,15 +1,51 @@
-const fs = require('fs');
-const path = require('path');
-const express = require('express');
-const writeFileAtomicSync = require('write-file-atomic').sync;
-const { DIRECTORIES } = require('../constants');
-const { getConfigValue, generateTimestamp, removeOldBackups } = require('../util');
-const { jsonParser } = require('../express-common');
-const { migrateSecrets } = require('./secrets');
+import fs from 'node:fs';
+import path from 'node:path';
 
-const enableExtensions = getConfigValue('enableExtensions', true);
-const SETTINGS_FILE = './public/settings.json';
+import express from 'express';
+import _ from 'lodash';
+import { sync as writeFileAtomicSync } from 'write-file-atomic';
 
+import { SETTINGS_FILE } from '../constants.js';
+import { getConfigValue, generateTimestamp, removeOldBackups } from '../util.js';
+import { jsonParser } from '../express-common.js';
+import { getAllUserHandles, getUserDirectories } from '../users.js';
+
+const ENABLE_EXTENSIONS = getConfigValue('enableExtensions', true);
+const ENABLE_EXTENSIONS_AUTO_UPDATE = getConfigValue('enableExtensionsAutoUpdate', true);
+const ENABLE_ACCOUNTS = getConfigValue('enableUserAccounts', false);
+
+// 10 minutes
+const AUTOSAVE_INTERVAL = 10 * 60 * 1000;
+
+/**
+ * Map of functions to trigger settings autosave for a user.
+ * @type {Map<string, function>}
+ */
+const AUTOSAVE_FUNCTIONS = new Map();
+
+/**
+ * Triggers autosave for a user every 10 minutes.
+ * @param {string} handle User handle
+ * @returns {void}
+ */
+function triggerAutoSave(handle) {
+    if (!AUTOSAVE_FUNCTIONS.has(handle)) {
+        const throttledAutoSave = _.throttle(() => backupUserSettings(handle, true), AUTOSAVE_INTERVAL);
+        AUTOSAVE_FUNCTIONS.set(handle, throttledAutoSave);
+    }
+
+    const functionToCall = AUTOSAVE_FUNCTIONS.get(handle);
+    if (functionToCall && typeof functionToCall === 'function') {
+        functionToCall();
+    }
+}
+
+/**
+ * Reads and parses files from a directory.
+ * @param {string} directoryPath Path to the directory
+ * @param {string} fileExtension File extension
+ * @returns {Array} Parsed files
+ */
 function readAndParseFromDirectory(directoryPath, fileExtension = '.json') {
     const files = fs
         .readdirSync(directoryPath)
@@ -31,8 +67,22 @@ function readAndParseFromDirectory(directoryPath, fileExtension = '.json') {
     return parsedFiles;
 }
 
+/**
+ * Gets a sort function for sorting strings.
+ * @param {*} _
+ * @returns {(a: string, b: string) => number} Sort function
+ */
 function sortByName(_) {
     return (a, b) => a.localeCompare(b);
+}
+
+/**
+ * Gets backup file prefix for user settings.
+ * @param {string} handle User handle
+ * @returns {string} File prefix
+ */
+function getFilePrefix(handle) {
+    return `settings_${handle}_`;
 }
 
 function readPresetsFromDirectory(directoryPath, options = {}) {
@@ -61,26 +111,94 @@ function readPresetsFromDirectory(directoryPath, options = {}) {
     return { fileContents, fileNames };
 }
 
-function backupSettings() {
+async function backupSettings() {
     try {
-        if (!fs.existsSync(DIRECTORIES.backups)) {
-            fs.mkdirSync(DIRECTORIES.backups);
+        const userHandles = await getAllUserHandles();
+
+        for (const handle of userHandles) {
+            backupUserSettings(handle, true);
         }
-
-        const backupFile = path.join(DIRECTORIES.backups, `settings_${generateTimestamp()}.json`);
-        fs.copyFileSync(SETTINGS_FILE, backupFile);
-
-        removeOldBackups('settings_');
     } catch (err) {
         console.log('Could not backup settings file', err);
     }
 }
 
-const router = express.Router();
+/**
+ * Makes a backup of the user's settings file.
+ * @param {string} handle User handle
+ * @param {boolean} preventDuplicates Prevent duplicate backups
+ * @returns {void}
+ */
+function backupUserSettings(handle, preventDuplicates) {
+    const userDirectories = getUserDirectories(handle);
+    const backupFile = path.join(userDirectories.backups, `${getFilePrefix(handle)}${generateTimestamp()}.json`);
+    const sourceFile = path.join(userDirectories.root, SETTINGS_FILE);
+
+    if (preventDuplicates && isDuplicateBackup(handle, sourceFile)) {
+        return;
+    }
+
+    if (!fs.existsSync(sourceFile)) {
+        return;
+    }
+
+    fs.copyFileSync(sourceFile, backupFile);
+    removeOldBackups(userDirectories.backups, `settings_${handle}`);
+}
+
+/**
+ * Checks if the backup would be a duplicate.
+ * @param {string} handle User handle
+ * @param {string} sourceFile Source file path
+ * @returns {boolean} True if the backup is a duplicate
+ */
+function isDuplicateBackup(handle, sourceFile) {
+    const latestBackup = getLatestBackup(handle);
+    if (!latestBackup) {
+        return false;
+    }
+    return areFilesEqual(latestBackup, sourceFile);
+}
+
+/**
+ * Returns true if the two files are equal.
+ * @param {string} file1 File path
+ * @param {string} file2 File path
+ */
+function areFilesEqual(file1, file2) {
+    if (!fs.existsSync(file1) || !fs.existsSync(file2)) {
+        return false;
+    }
+
+    const content1 = fs.readFileSync(file1);
+    const content2 = fs.readFileSync(file2);
+    return content1.toString() === content2.toString();
+}
+
+/**
+ * Gets the latest backup file for a user.
+ * @param {string} handle User handle
+ * @returns {string|null} Latest backup file. Null if no backup exists.
+ */
+function getLatestBackup(handle) {
+    const userDirectories = getUserDirectories(handle);
+    const backupFiles = fs.readdirSync(userDirectories.backups)
+        .filter(x => x.startsWith(getFilePrefix(handle)))
+        .map(x => ({ name: x, ctime: fs.statSync(path.join(userDirectories.backups, x)).ctimeMs }));
+    const latestBackup = backupFiles.sort((a, b) => b.ctime - a.ctime)[0]?.name;
+    if (!latestBackup) {
+        return null;
+    }
+    return path.join(userDirectories.backups, latestBackup);
+}
+
+export const router = express.Router();
 
 router.post('/save', jsonParser, function (request, response) {
     try {
-        writeFileAtomicSync('public/settings.json', JSON.stringify(request.body, null, 4), 'utf8');
+        const pathToSettings = path.join(request.user.directories.root, SETTINGS_FILE);
+        writeFileAtomicSync(pathToSettings, JSON.stringify(request.body, null, 4), 'utf8');
+        triggerAutoSave(request.user.profile.handle);
         response.send({ result: 'ok' });
     } catch (err) {
         console.log(err);
@@ -92,48 +210,50 @@ router.post('/save', jsonParser, function (request, response) {
 router.post('/get', jsonParser, (request, response) => {
     let settings;
     try {
-        settings = fs.readFileSync('public/settings.json', 'utf8');
+        const pathToSettings = path.join(request.user.directories.root, SETTINGS_FILE);
+        settings = fs.readFileSync(pathToSettings, 'utf8');
     } catch (e) {
         return response.sendStatus(500);
     }
 
     // NovelAI Settings
     const { fileContents: novelai_settings, fileNames: novelai_setting_names }
-        = readPresetsFromDirectory(DIRECTORIES.novelAI_Settings, {
-            sortFunction: sortByName(DIRECTORIES.novelAI_Settings),
+        = readPresetsFromDirectory(request.user.directories.novelAI_Settings, {
+            sortFunction: sortByName(request.user.directories.novelAI_Settings),
             removeFileExtension: true,
         });
 
     // OpenAI Settings
     const { fileContents: openai_settings, fileNames: openai_setting_names }
-        = readPresetsFromDirectory(DIRECTORIES.openAI_Settings, {
-            sortFunction: sortByName(DIRECTORIES.openAI_Settings), removeFileExtension: true,
+        = readPresetsFromDirectory(request.user.directories.openAI_Settings, {
+            sortFunction: sortByName(request.user.directories.openAI_Settings), removeFileExtension: true,
         });
 
     // TextGenerationWebUI Settings
     const { fileContents: textgenerationwebui_presets, fileNames: textgenerationwebui_preset_names }
-        = readPresetsFromDirectory(DIRECTORIES.textGen_Settings, {
-            sortFunction: sortByName(DIRECTORIES.textGen_Settings), removeFileExtension: true,
+        = readPresetsFromDirectory(request.user.directories.textGen_Settings, {
+            sortFunction: sortByName(request.user.directories.textGen_Settings), removeFileExtension: true,
         });
 
     //Kobold
     const { fileContents: koboldai_settings, fileNames: koboldai_setting_names }
-        = readPresetsFromDirectory(DIRECTORIES.koboldAI_Settings, {
-            sortFunction: sortByName(DIRECTORIES.koboldAI_Settings), removeFileExtension: true,
+        = readPresetsFromDirectory(request.user.directories.koboldAI_Settings, {
+            sortFunction: sortByName(request.user.directories.koboldAI_Settings), removeFileExtension: true,
         });
 
     const worldFiles = fs
-        .readdirSync(DIRECTORIES.worlds)
+        .readdirSync(request.user.directories.worlds)
         .filter(file => path.extname(file).toLowerCase() === '.json')
         .sort((a, b) => a.localeCompare(b));
     const world_names = worldFiles.map(item => path.parse(item).name);
 
-    const themes = readAndParseFromDirectory(DIRECTORIES.themes);
-    const movingUIPresets = readAndParseFromDirectory(DIRECTORIES.movingUI);
-    const quickReplyPresets = readAndParseFromDirectory(DIRECTORIES.quickreplies);
+    const themes = readAndParseFromDirectory(request.user.directories.themes);
+    const movingUIPresets = readAndParseFromDirectory(request.user.directories.movingUI);
+    const quickReplyPresets = readAndParseFromDirectory(request.user.directories.quickreplies);
 
-    const instruct = readAndParseFromDirectory(DIRECTORIES.instruct);
-    const context = readAndParseFromDirectory(DIRECTORIES.context);
+    const instruct = readAndParseFromDirectory(request.user.directories.instruct);
+    const context = readAndParseFromDirectory(request.user.directories.context);
+    const sysprompt = readAndParseFromDirectory(request.user.directories.sysprompt);
 
     response.send({
         settings,
@@ -151,14 +271,94 @@ router.post('/get', jsonParser, (request, response) => {
         quickReplyPresets,
         instruct,
         context,
-        enable_extensions: enableExtensions,
+        sysprompt,
+        enable_extensions: ENABLE_EXTENSIONS,
+        enable_extensions_auto_update: ENABLE_EXTENSIONS_AUTO_UPDATE,
+        enable_accounts: ENABLE_ACCOUNTS,
     });
 });
 
-// Sync for now, but should probably be migrated to async file APIs
-async function init() {
-    backupSettings();
-    migrateSecrets(SETTINGS_FILE);
-}
+router.post('/get-snapshots', jsonParser, async (request, response) => {
+    try {
+        const snapshots = fs.readdirSync(request.user.directories.backups);
+        const userFilesPattern = getFilePrefix(request.user.profile.handle);
+        const userSnapshots = snapshots.filter(x => x.startsWith(userFilesPattern));
 
-module.exports = { router, init };
+        const result = userSnapshots.map(x => {
+            const stat = fs.statSync(path.join(request.user.directories.backups, x));
+            return { date: stat.ctimeMs, name: x, size: stat.size };
+        });
+
+        response.json(result);
+    } catch (error) {
+        console.log(error);
+        response.sendStatus(500);
+    }
+});
+
+router.post('/load-snapshot', jsonParser, async (request, response) => {
+    try {
+        const userFilesPattern = getFilePrefix(request.user.profile.handle);
+
+        if (!request.body.name || !request.body.name.startsWith(userFilesPattern)) {
+            return response.status(400).send({ error: 'Invalid snapshot name' });
+        }
+
+        const snapshotName = request.body.name;
+        const snapshotPath = path.join(request.user.directories.backups, snapshotName);
+
+        if (!fs.existsSync(snapshotPath)) {
+            return response.sendStatus(404);
+        }
+
+        const content = fs.readFileSync(snapshotPath, 'utf8');
+
+        response.send(content);
+    } catch (error) {
+        console.log(error);
+        response.sendStatus(500);
+    }
+});
+
+router.post('/make-snapshot', jsonParser, async (request, response) => {
+    try {
+        backupUserSettings(request.user.profile.handle, false);
+        response.sendStatus(204);
+    } catch (error) {
+        console.log(error);
+        response.sendStatus(500);
+    }
+});
+
+router.post('/restore-snapshot', jsonParser, async (request, response) => {
+    try {
+        const userFilesPattern = getFilePrefix(request.user.profile.handle);
+
+        if (!request.body.name || !request.body.name.startsWith(userFilesPattern)) {
+            return response.status(400).send({ error: 'Invalid snapshot name' });
+        }
+
+        const snapshotName = request.body.name;
+        const snapshotPath = path.join(request.user.directories.backups, snapshotName);
+
+        if (!fs.existsSync(snapshotPath)) {
+            return response.sendStatus(404);
+        }
+
+        const pathToSettings = path.join(request.user.directories.root, SETTINGS_FILE);
+        fs.rmSync(pathToSettings, { force: true });
+        fs.copyFileSync(snapshotPath, pathToSettings);
+
+        response.sendStatus(204);
+    } catch (error) {
+        console.log(error);
+        response.sendStatus(500);
+    }
+});
+
+/**
+ * Initializes the settings endpoint
+ */
+export async function init() {
+    await backupSettings();
+}
